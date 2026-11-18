@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.cmd text eol=crlf
+# The contract kit is copied byte for byte from the reference repository.
+contract/** -text

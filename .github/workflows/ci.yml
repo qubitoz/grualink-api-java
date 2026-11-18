@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [17, 21]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Contract kit is unmodified
+        run: |
+          sha256sum --check --strict <<'SUMS'
+          2faa9d90c31150d13a6c1d134c283e24c6becef0d85534e503c3cb4ca4833b69  contract/API.es.md
+          1827cf01e71acd5fe630663140ebeb81318fea466e6b5b4394682cf4d05f1510  contract/API.md
+          041c07c7ef2137dd07f5cf890ccf4225d370f87d8983fb3f4cba195c8b4b3276  contract/checklist.md
+          a3e9bfc9db9ecbcf94ed421c04fa0f0d349cd9c9358dd64792e44e82a362862c  contract/signature-vectors.json
+          SUMS
+          test "$(find contract -type f | wc -l)" -eq 4
+      - name: Compile with every warning as an error, then test
+        run: ./mvnw -B verify
+      - name: Run both examples with the documented commands against a local fake server
+        env:
+          GRUALINK_API_KEY: glk_test_FAKE_KEY_FOR_CI_ONLY
+          GRUALINK_API_BASE_URL: http://127.0.0.1:8089/api/v1
+          GRUALINK_WEBHOOK_SECRET: whsec_TEST_ONLY_FAKE_SECRET_0001
+          PORT: "8788"
+        run: |
+          set -euo pipefail
+          wait_for() { # file, text
+            for _ in $(seq 1 90); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 1; done
+            echo "::error::no \"$2\" in $1"; cat "$1"; return 1
+          }
+
+          # 1. Request a tow truck. The API is the fake of the test suite, as a process.
+          ./mvnw -B -q test-compile exec:java -Dexec.classpathScope=test \
+            -Dexec.mainClass=mx.grualink.api.FakeApiServer -Dexec.args=8089 > fake-api.log 2>&1 &
+          fake_api=$!
+          wait_for fake-api.log "Fake API listening"
+          ./mvnw -B -q compile exec:java@request-tow | tee request-tow.out
+          grep -q "Total:     1002.62 MXN" request-tow.out
+          grep -q "replayed=true, same id=true" request-tow.out
+          grep -q 'Status now: "confirmed"' request-tow.out
+          if grep -q "$GRUALINK_API_KEY" request-tow.out; then echo "::error::the example printed the key"; exit 1; fi
+          kill "$fake_api"
+
+          # 2. Receive webhooks. The deliveries are signed here with openssl, a second implementation.
+          ./mvnw -B -q compile exec:java@webhook-server > webhook-server.log 2>&1 &
+          webhook_server=$!
+          wait_for webhook-server.log "Listening for GRUALINK webhooks"
+          id=aaaaaaaa-0000-4000-8000-000000000009
+          body='{"id": "'$id'", "object": "event", "type": "webhook.test", "mode": "test", "created_at": "2026-11-18T10:06:00.000Z", "data": {"message": "Hola"}}'
+          deliver() { # body, timestamp
+            signature=$(printf '%s.%s' "$2" "$body" | openssl dgst -sha256 -hmac "$GRUALINK_WEBHOOK_SECRET" -r | cut -d' ' -f1)
+            curl -sS -o answer.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/webhooks/grualink" \
+              -H 'Content-Type: application/json; charset=utf-8' -H "X-GruaLink-Delivery: $id" \
+              -H "X-GruaLink-Signature: t=$2,v1=$signature" --data-binary "$1"
+          }
+          now=$(date +%s)
+          expect() { # status, body of the answer
+            if [ "$status" != "$1" ] || ! grep -qx "$2" answer.json; then
+              echo "::error::expected $1 $2, got $status $(cat answer.json)"; exit 1
+            fi
+          }
+          status=$(deliver "$body" "$now"); expect 200 '{"received":true}'
+          status=$(deliver "$body" "$now"); expect 200 '{"received":true,"duplicate":true}'
+          status=$(deliver "${body/Hola/Adios}" "$now"); expect 401 '{"received":false,"error":"invalid_signature"}'
+          status=$(deliver "$body" "$((now - 3600))"); expect 401 '{"received":false,"error":"invalid_signature"}'
+          kill "$webhook_server"
+          cat webhook-server.log
+          test "$(grep -c '\[test\] webhook.test: Hola' webhook-server.log)" = 1
+          grep -q "401 (signature_mismatch)" webhook-server.log
+          grep -q "401 (timestamp_out_of_tolerance)" webhook-server.log
+          if grep -q "$GRUALINK_WEBHOOK_SECRET" webhook-server.log; then echo "::error::the example printed the secret"; exit 1; fi
